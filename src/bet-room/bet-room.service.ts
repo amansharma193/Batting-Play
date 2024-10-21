@@ -153,7 +153,12 @@ export class BetRoomService {
     const isOdd = winningNumber % 2 !== 0;
 
     // Fetch winners for the exact number, odd, or even bets
-    const winners = await this.getWinners(roomId, winningNumber, isOdd);
+    const winners = await this.getWinners(
+      roomId,
+      winningNumber,
+      isOdd,
+      roundId,
+    );
 
     this.logger.log(
       `Winning number for room ${roomId} - ${roundId}: ${winningNumber}`,
@@ -250,10 +255,12 @@ export class BetRoomService {
     roomId: string,
     winningNumber: number,
     isOdd: boolean,
+    roundId: string,
   ): Promise<any[]> {
     // Fetch all users who bet on the winning number, or bet on odd/even
     const winners = await this.betService.find({
       roomId,
+      roundId,
       $or: [
         { number: winningNumber }, // Users who bet on the exact number
         { number: isOdd ? 'odd' : 'even' }, // Users who bet on odd or even
