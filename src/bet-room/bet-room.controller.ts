@@ -18,11 +18,10 @@ export class BetRoomController {
   // Create a new room
   @Post('create')
   async createRoom(@Body() body: CreateRoomDto) {
-    const { name, drawInterval, roomId } = body; // Destructuring with defaults
+    const { name, drawInterval } = body; // Destructuring with defaults
     return this.betRoomService.createRoom(
       name || `defaultName-${new Date().getTime()}`,
       drawInterval || 10,
-      roomId,
     ); // Set defaults if missing
   }
 

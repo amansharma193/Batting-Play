@@ -17,13 +17,13 @@ export class Round extends Document {
   @Prop({ required: true, default: new Types.ObjectId(), unique: false })
   roundId: string;
 
-  @Prop({ required: true })
+  @Prop({ required: false })
   winningNumber: number;
 
-  @Prop({ required: true })
+  @Prop({ required: true, default: [] })
   winner: string[];
 
-  @Prop({ required: true })
+  @Prop({ required: true, default: 0 })
   payoutMultiplier: number;
 
   @Prop({ default: 'open' }) // Each round has its own status

@@ -16,6 +16,14 @@ import { Round } from 'src/schemas/round.schema';
 @Injectable()
 export class BetRoomService {
   private readonly logger = new Logger(BetRoomService.name);
+  private roomTimers: {
+    [roomId: string]: {
+      roundId: string;
+      startTime: number;
+      timer?: NodeJS.Timeout;
+    };
+  } = {};
+  private activeUsersInRoom: { [roomId: string]: Set<string> } = {}; // Track active users per room
 
   constructor(
     @InjectModel('BetRoom') private betRoomModel: Model<BetRoom>,
@@ -30,20 +38,15 @@ export class BetRoomService {
   }
 
   // Create a new betting room
-  async createRoom(
-    name: string,
-    drawInterval: number,
-    roomId: string,
-  ): Promise<BetRoom> {
+  async createRoom(name: string, drawInterval: number): Promise<BetRoom> {
     const room = new this.betRoomModel({
       name: name,
       status: 'open',
       drawInterval,
-      roomId,
     });
-    await room.save();
+    const savedRoom = await room.save();
     this.betRoomGateway.sendRoomUpdate('roomCreated', room);
-
+    this.startRound(savedRoom._id.toString(), drawInterval);
     return room;
   }
 
@@ -60,7 +63,104 @@ export class BetRoomService {
       roomId,
     });
 
-    return await newRound.save();
+    const response = await newRound.save();
+
+    // this.betRoomGateway.sendRoomUpdate(roomId, { roundId: response.roundId });
+    return response;
+  }
+
+  async joinRoom(roomId: string, userId: string): Promise<void> {
+    // Initialize the room's user list if not already done
+    if (!this.activeUsersInRoom[roomId]) {
+      this.activeUsersInRoom[roomId] = new Set<string>();
+    }
+
+    // Add user to the active users list
+    this.activeUsersInRoom[roomId].add(userId);
+    const remainingTime = this.getRemainingTime(roomId);
+    const roundId = this.roomTimers[roomId]?.roundId || null;
+
+    // If no active round and there are users, start a new round
+    if (!this.roomTimers[roomId] && this.activeUsersInRoom[roomId].size > 0) {
+      this.startRound(roomId, 60); // Start a new round with a 60-second interval
+    }
+
+    // Notify the user about the current round
+    this.betRoomGateway.sendToUser(userId, {
+      event: 'joinRoom',
+      roundId,
+      remainingTime,
+    });
+  }
+
+  async leaveRoom(roomId: string, userId: string): Promise<void> {
+    if (this.activeUsersInRoom[roomId]) {
+      this.activeUsersInRoom[roomId].delete(userId);
+
+      // If no users remain in the room, stop the timer and pause rounds
+      if (this.activeUsersInRoom[roomId].size === 0) {
+        this.stopRound(roomId);
+      }
+    }
+  }
+  getRemainingTime(roomId: string): number {
+    const roomTimer = this.roomTimers[roomId];
+    if (roomTimer) {
+      const elapsedTime = (Date.now() - roomTimer.startTime) / 1000;
+      return Math.max(0, 60 - elapsedTime); // Assuming 60 seconds per round
+    }
+    return 0;
+  }
+  async startRound(roomId: string, drawInterval: number): Promise<void> {
+    const roundId = this.generateRoundId();
+    const startTime = new Date();
+
+    // Create a new round document and save it asynchronously in the database
+    const newRound = new this.roundModel({
+      roundId,
+      roomId,
+      startTime,
+    });
+
+    await newRound.save(); // Save the round details to the database
+
+    // Only start the round if there are active users in the room
+    if (
+      this.activeUsersInRoom[roomId] &&
+      this.activeUsersInRoom[roomId].size > 0
+    ) {
+      const timer = setTimeout(async () => {
+        await this.settleBets(roomId, roundId); // Pass roundId to settleBets
+      }, drawInterval * 1000);
+
+      // Store the round timer information
+      this.roomTimers[roomId] = {
+        roundId,
+        startTime: startTime.getTime(),
+        timer,
+      };
+
+      // Notify users about the new round asynchronously
+      await this.betRoomGateway.sendRoomUpdate(roomId, {
+        event: 'newRound',
+        roundId,
+        remainingTime: drawInterval,
+      });
+    }
+  }
+  stopRound(roomId: string): void {
+    const roomTimer = this.roomTimers[roomId];
+    if (roomTimer && roomTimer.timer) {
+      clearTimeout(roomTimer.timer); // Clear the round timer
+      delete this.roomTimers[roomId]; // Remove the round timer data
+      this.logger.log(
+        `Round stopped for room: ${roomId} due to no active users.`,
+      );
+    }
+  }
+
+  generateRoundId(): string {
+    return new Types.ObjectId().toString(); // You can replace this with UUID generation logic
   }
 
   async closeRound(roomId: string, roundId: string): Promise<Round> {
@@ -147,7 +247,7 @@ export class BetRoomService {
     const numbers: any[] = Object.values(numberStats);
 
     // Call selectWinner function to determine the winner
-    const winningNumber = this.selectWinner(numbers, totalInvestment);
+    const winningNumber = await this.selectWinner(numbers, totalInvestment);
 
     // Determine if the winning number is odd or even
     const isOdd = winningNumber % 2 !== 0;
@@ -171,6 +271,13 @@ export class BetRoomService {
       winningNumber,
       winners,
     });
+
+    if (
+      this.activeUsersInRoom[roomId] &&
+      this.activeUsersInRoom[roomId].size > 0
+    ) {
+      await this.startRound(roomId, 60); // Start a new round with a 60-second interval
+    }
 
     // Close the room
     // room.status = 'closed';
@@ -200,54 +307,112 @@ export class BetRoomService {
     const room = await this.betRoomModel.findById(roomId).exec();
     if (room) {
       const bets = await this.getBetsForRoom(roomId);
-      console.log(bets);
       return { room, bets };
     }
     return {};
   }
 
   // Logic to select the winner based on the given rules
-  private selectWinner(
-    numbers: { number: number; amount: number; totalUsers: number }[],
+  private async selectWinner(
+    numbers: {
+      number: number | 'odd' | 'even';
+      amount: number;
+      totalUsers: number;
+    }[],
     totalInvestment: number,
-  ): number {
-    const maxPayout = totalInvestment * 0.9; // 90% of total investment
+  ): Promise<number> {
+    try {
+      const maxPayout = totalInvestment * 0.9; // 90% of total investment
 
-    // Ensure all numbers (0-9) are considered
-    const completeNumbers = Array.from({ length: 10 }, (_, i) => ({
-      number: i,
-      amount: 0,
-      totalUsers: 0,
-    }));
+      // Initialize complete number set (0-9) and map bets to numbers
+      const completeNumbers = Array.from({ length: 10 }, (_, i) => ({
+        number: i,
+        amount: 0,
+        totalUsers: 0,
+      }));
 
-    // Merge actual bet data with complete set of numbers (0-9)
-    for (const bet of numbers) {
-      const existingNumber = completeNumbers.find(
-        (num) => num.number === bet.number,
+      // Separate tracking for "odd" and "even" bets
+      const oddBet = { amount: 0, totalUsers: 0 };
+      const evenBet = { amount: 0, totalUsers: 0 };
+
+      // Merge bet data into complete numbers and handle "odd"/"even" bets
+      numbers.forEach(({ number, amount, totalUsers }) => {
+        if (number === 'odd') {
+          oddBet.amount += amount;
+          oddBet.totalUsers += totalUsers;
+        } else if (number === 'even') {
+          evenBet.amount += amount;
+          evenBet.totalUsers += totalUsers;
+        } else {
+          completeNumbers[number].amount += amount;
+          completeNumbers[number].totalUsers += totalUsers;
+        }
+      });
+
+      // Filter out profit numbers within maxPayout limit
+      const profitNumbers = completeNumbers.filter(
+        ({ amount }) => amount * 9 <= maxPayout,
       );
-      if (existingNumber) {
-        existingNumber.amount += bet.amount;
-        existingNumber.totalUsers += bet.totalUsers;
+
+      if (profitNumbers.length === 0) {
+        return 0; // No valid number found, return default
       }
-    }
 
-    // Sort numbers by descending totalUsers (weight) first, then by amount
-    completeNumbers.sort(
-      (a, b) => b.totalUsers - a.totalUsers || b.amount - a.amount,
-    );
+      // Include odd/even numbers in the profit calculation
+      let bestNumber = profitNumbers[0];
+      let highestPayout = bestNumber.amount * 9;
+      let fewestUsers = bestNumber.totalUsers;
 
-    // Try to find a valid winner based on the maxPayout constraint
-    for (const { number, amount } of completeNumbers) {
-      const potentialPayout = amount * 9;
+      for (const current of profitNumbers) {
+        const potentialPayout = current.amount * 9;
 
-      // If the potential payout is within the max payout constraint, return this number
-      if (potentialPayout <= maxPayout) {
-        return number;
+        if (
+          potentialPayout > highestPayout ||
+          (potentialPayout === highestPayout &&
+            current.totalUsers < fewestUsers)
+        ) {
+          bestNumber = current;
+          highestPayout = potentialPayout;
+          fewestUsers = current.totalUsers;
+        } else if (
+          potentialPayout === highestPayout &&
+          current.totalUsers === fewestUsers &&
+          Math.random() < 0.5
+        ) {
+          bestNumber = current;
+        }
       }
-    }
 
-    // If no number meets the payout constraint, return any number (fallback)
-    return completeNumbers[0].number;
+      // After checking individual numbers, compare with odd/even bets
+      const oddPayout = oddBet.amount * 9;
+      const evenPayout = evenBet.amount * 9;
+
+      if (
+        oddPayout <= maxPayout &&
+        (oddPayout > highestPayout ||
+          (oddPayout === highestPayout && oddBet.totalUsers < fewestUsers))
+      ) {
+        // Odd wins
+        const oddNumbers = [1, 3, 5, 7, 9];
+        return oddNumbers[Math.floor(Math.random() * oddNumbers.length)];
+      }
+
+      if (
+        evenPayout <= maxPayout &&
+        (evenPayout > highestPayout ||
+          (evenPayout === highestPayout && evenBet.totalUsers < fewestUsers))
+      ) {
+        // Even wins
+        const evenNumbers = [0, 2, 4, 6, 8];
+        return evenNumbers[Math.floor(Math.random() * evenNumbers.length)];
+      }
+
+      // Return the best individual number if odd/even didn’t win
+      return bestNumber.number;
+    } catch (e) {
+      console.log('Error selecting winner:', e);
+      return 0; // Fallback in case of error
+    }
   }
 
   // Fetch the winners for a specific room and winning number

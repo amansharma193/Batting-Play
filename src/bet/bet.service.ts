@@ -56,7 +56,12 @@ export class BetService {
       this.startBetTimer(roomId, round.roundId);
     }
 
-    const existingBet = await this.betModel.findOne({ userId, roomId, number });
+    const existingBet = await this.betModel.findOne({
+      userId,
+      roomId,
+      number,
+      roundId,
+    });
 
     if (existingBet) {
       return existingBet; // Return the existing bet if found
@@ -85,7 +90,7 @@ export class BetService {
   }
   // Get bets for a room
   async getBetsForRoom(roomId: string): Promise<Bet[]> {
-    return await this.betModel.find({ roomId }).exec();
+    return await this.betModel.find({ roundId: roomId }).exec();
   }
 
   // Get winners for a room based on the winning number

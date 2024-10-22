@@ -76,11 +76,19 @@ export class BetRoomGateway
 
   @SubscribeMessage('startRound') // Listen for a 'startRound' event from the frontend
   async handleStartRound() {
-    await this.betRoomService.createNewRound('671421cb01ef20f3a8e209dc');
-    this.server.emit('roundStarted', { message: 'A new round has started' });
+    const round = await this.betRoomService.createNewRound(
+      '671421cb01ef20f3a8e209dc',
+    );
+    this.server.emit('roundStarted', {
+      message: 'A new round has started',
+      roundId: round.roundId,
+    });
   }
 
   sendRoundClosedNotification(roomId: string, message: any) {
     this.server.to(roomId).emit('roundClosed', message);
+  }
+  sendToUser(userId: string, update: any) {
+    this.server.to(userId).emit('userUpdate', update);
   }
 }
